@@ -1,0 +1,308 @@
+# ============================================================
+# YOLO Object Detection 
+# ============================================================
+
+# ── CELL 1: Imports ──────────────────────────────────────────
+import os, cv2, colorsys
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from PIL import Image, ImageDraw, ImageFont
+from copy import deepcopy
+
+# ── CELL 2: Download assets ──────────────────────────────────
+DATA_ROOT = '/content/data'
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+BASE = "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20%20Object%20Detection%20(Autonomous%20Vehicles)"
+
+import subprocess
+subprocess.run(["wget", "-q", "-O", "/content/data/image.jpg",        f"{BASE}/image.jpg"],  check=True)
+subprocess.run(["wget", "-q", "-O", "/content/data/image2.jpg",       f"{BASE}/image2.jpg"], check=True)
+subprocess.run(["wget", "-q", "-O", "/content/data/video1.mp4",       f"{BASE}/6.mp4"],      check=True)
+subprocess.run(["wget", "-q", "-O", "/content/data/yolo_weights.h5",  f"{BASE}/yolo.h5"],    check=True)
+
+model_path = '/content/data/yolo_weights.h5'
+print("Downloads complete.")
+
+# ── CELL 3: Labels & anchors ─────────────────────────────────
+labels = [
+    "person","bicycle","car","motorbike","aeroplane","bus","train","truck",
+    "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
+    "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe",
+    "backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard",
+    "sports ball","kite","baseball bat","baseball glove","skateboard","surfboard",
+    "tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl",
+    "banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza",
+    "donut","cake","chair","sofa","pottedplant","bed","diningtable","toilet",
+    "tvmonitor","laptop","mouse","remote","keyboard","cell phone","microwave",
+    "oven","toaster","sink","refrigerator","book","clock","vase","scissors",
+    "teddy bear","hair drier","toothbrush"
+]
+
+anchors = [
+    [[116, 90], [156, 198], [373, 326]],
+    [[30,  61], [62,  45],  [59,  119]],
+    [[10,  13], [16,  30],  [33,  23]]
+]
+
+# ── CELL 4: Helper classes & functions ───────────────────────
+class BoundBox:
+    def __init__(self, xmin, ymin, xmax, ymax, objness=None, classes=None):
+        self.xmin, self.ymin = xmin, ymin
+        self.xmax, self.ymax = xmax, ymax
+        self.objness = objness
+        self.classes = classes
+        self.label = -1
+        self.score = -1
+
+    def get_label(self):
+        if self.label == -1:
+            self.label = np.argmax(self.classes)
+        return self.label
+
+    def get_score(self):
+        if self.score == -1:
+            self.score = self.classes[self.get_label()]
+        return self.score
+
+
+def _sigmoid(x):
+    return 1. / (1. + np.exp(-x))
+
+
+def _interval_overlap(a, b):
+    x1, x2 = a
+    x3, x4 = b
+    if x3 < x1:
+        return 0 if x4 < x1 else min(x2, x4) - x1
+    else:
+        return 0 if x2 < x3 else min(x2, x4) - x3
+
+
+def bbox_iou(box1, box2):
+    iw = _interval_overlap([box1.xmin, box1.xmax], [box2.xmin, box2.xmax])
+    ih = _interval_overlap([box1.ymin, box1.ymax], [box2.ymin, box2.ymax])
+    intersect = iw * ih
+    w1, h1 = box1.xmax - box1.xmin, box1.ymax - box1.ymin
+    w2, h2 = box2.xmax - box2.xmin, box2.ymax - box2.ymin
+    union = w1 * h1 + w2 * h2 - intersect
+    return float(intersect) / union if union else 0.0
+
+
+def preprocess_input(image_pil, net_h, net_w):
+    image = np.asarray(image_pil)
+    new_h, new_w = image.shape[:2]
+    if (float(net_w) / new_w) < (float(net_h) / new_h):
+        new_h = int(new_h * net_w / new_w)
+        new_w = net_w
+    else:
+        new_w = int(new_w * net_h / new_h)
+        new_h = net_h
+    resized = cv2.resize(image / 255., (new_w, new_h))
+    canvas = np.ones((net_h, net_w, 3)) * 0.5
+    dy, dx = (net_h - new_h) // 2, (net_w - new_w) // 2
+    canvas[dy:dy + new_h, dx:dx + new_w, :] = resized
+    return np.expand_dims(canvas, 0)
+
+
+def correct_yolo_boxes(boxes_, image_h, image_w, net_h, net_w):
+    boxes = deepcopy(boxes_)
+    if (float(net_w) / image_w) < (float(net_h) / image_h):
+        new_w, new_h = net_w, (image_h * net_w) / image_w
+    else:
+        new_h, new_w = net_w, (image_w * net_h) / image_h
+    x_offset = (net_w - new_w) / 2. / net_w
+    x_scale  = float(new_w) / net_w
+    y_offset = (net_h - new_h) / 2. / net_h
+    y_scale  = float(new_h) / net_h
+    for b in boxes:
+        b.xmin = int((b.xmin - x_offset) / x_scale * image_w)
+        b.xmax = int((b.xmax - x_offset) / x_scale * image_w)
+        b.ymin = int((b.ymin - y_offset) / y_scale * image_h)
+        b.ymax = int((b.ymax - y_offset) / y_scale * image_h)
+    return boxes
+
+
+def decode_netout(netout_, obj_thresh, anchors_, image_h, image_w, net_h, net_w):
+    boxes_all = []
+    for i, netout_raw in enumerate(netout_):
+        netout = deepcopy(netout_raw)[0]
+        anch   = anchors_[i]
+        grid_h, grid_w = netout.shape[:2]
+        nb_box = 3
+        netout = netout.reshape((grid_h, grid_w, nb_box, -1))
+        netout[..., :2] = _sigmoid(netout[..., :2])
+        netout[..., 4:] = _sigmoid(netout[..., 4:])
+        netout[..., 5:] = netout[..., 4][..., np.newaxis] * netout[..., 5:]
+        netout[..., 5:] *= netout[..., 5:] > obj_thresh
+        for row in range(grid_h):
+            for col in range(grid_w):
+                for b in range(nb_box):
+                    classes = netout[row, col, b, 5:]
+                    if (classes <= obj_thresh).all():
+                        continue
+                    x, y, w, h = netout[row, col, b, :4]
+                    x = (col + x) / grid_w
+                    y = (row + y) / grid_h
+                    w = anch[b][0] * np.exp(w) / net_w
+                    h = anch[b][1] * np.exp(h) / net_h
+                    objectness = netout[row, col, b, 4]
+                    boxes_all.append(BoundBox(x - w/2, y - h/2, x + w/2, y + h/2, objectness, classes))
+    return correct_yolo_boxes(boxes_all, image_h, image_w, net_h, net_w)
+
+
+def do_nms(boxes_, nms_thresh, obj_thresh):
+    boxes = deepcopy(boxes_)
+    if not boxes:
+        return []
+    num_class = len(boxes[0].classes)
+    for c in range(num_class):
+        sorted_indices = np.argsort([-box.classes[c] for box in boxes])
+        for i in range(len(sorted_indices)):
+            idx_i = sorted_indices[i]
+            if boxes[idx_i].classes[c] == 0:
+                continue
+            for j in range(i + 1, len(sorted_indices)):
+                idx_j = sorted_indices[j]
+                if bbox_iou(boxes[idx_i], boxes[idx_j]) >= nms_thresh:
+                    boxes[idx_j].classes[c] = 0
+    new_boxes = []
+    for box in boxes:
+        for i in range(num_class):
+            if box.classes[i] > obj_thresh:
+                box.label = i
+                box.score = box.classes[i]
+                new_boxes.append(box)
+                break
+    return new_boxes
+
+
+def _get_font(image_h):
+    size = max(12, int(3e-2 * image_h + 0.5))
+    candidates = [
+        '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+        '/usr/share/fonts/truetype/freefont/FreeMono.ttf',
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def draw_boxes(image_, boxes, labels):
+    image = image_.copy()
+    image_w, image_h = image.size
+    font = _get_font(image_h)
+    thickness = max(2, (image_w + image_h) // 300)
+
+    hsv_tuples = [(x / len(labels), 1., 1.) for x in range(len(labels))]
+    colors = [tuple(int(v * 255) for v in colorsys.hsv_to_rgb(*h)) for h in hsv_tuples]
+    rng = np.random.default_rng(10101)
+    colors = [colors[i] for i in rng.permutation(len(colors))]
+
+    for box in reversed(boxes):
+        c = box.get_label()
+        score = box.get_score()
+        top, left, bottom, right = box.ymin, box.xmin, box.ymax, box.xmax
+        top    = max(0, int(np.floor(top    + 0.5)))
+        left   = max(0, int(np.floor(left   + 0.5)))
+        bottom = min(image_h, int(np.floor(bottom + 0.5)))
+        right  = min(image_w, int(np.floor(right  + 0.5)))
+
+        label_text = '{} {:.2f}'.format(labels[c], score)
+        print(label_text, (left, top), (right, bottom))
+
+        draw = ImageDraw.Draw(image)
+        try:
+            bbox = draw.textbbox((0, 0), label_text, font=font)
+            lw, lh = bbox[2], bbox[3]
+        except AttributeError:
+            lw, lh = draw.textsize(label_text, font=font)
+
+        text_origin = (left, top - lh) if top - lh >= 0 else (left, top + 1)
+
+        if right > left and bottom > top:
+            draw.rectangle([left, top, right, bottom], outline=colors[c], width=thickness)
+        else:
+            print(f"  Skipping invalid box: {(left, top, right, bottom)}")
+
+        draw.text(text_origin, label_text, fill=(0, 0, 0), font=font)
+        del draw
+    return image
+
+
+# ── CELL 5: Load model ───────────────────────────────────────
+print("Loading YOLO model ...")
+darknet = tf.keras.models.load_model(model_path, compile=False)
+print("Model loaded.")
+
+gpus = tf.config.list_physical_devices('GPU')
+print("GPUs available:", gpus if gpus else "None — running on CPU (slower)")
+
+
+# ── CELL 6: detect_image & detect_video helpers ──────────────
+def detect_image(image_pil, obj_thresh=0.4, nms_thresh=0.45, net_h=416, net_w=416):
+    image_w, image_h = image_pil.size
+    new_image = preprocess_input(image_pil, net_h, net_w)
+    yolo_outputs = darknet.predict(new_image, verbose=0)
+    boxes = decode_netout(yolo_outputs, obj_thresh, anchors, image_h, image_w, net_h, net_w)
+    boxes = do_nms(boxes, nms_thresh, obj_thresh)
+    return draw_boxes(image_pil, boxes, labels)
+
+
+def detect_video(video_path, output_path, obj_thresh=0.4, nms_thresh=0.45, net_h=416, net_w=416):
+    vid = cv2.VideoCapture(video_path)
+    if not vid.isOpened():
+        raise IOError(f"Couldn't open video: {video_path}")
+
+    fourcc     = cv2.VideoWriter_fourcc(*'mp4v')
+    fps        = vid.get(cv2.CAP_PROP_FPS)
+    video_size = (int(vid.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                  int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    out = cv2.VideoWriter(output_path, fourcc, fps, video_size)
+
+    num_frame = 0
+    while vid.isOpened():
+        ret, frame = vid.read()
+        if not ret:
+            break
+        num_frame += 1
+        print(f"=== Frame {num_frame} ===")
+
+        frame_rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_pil  = Image.fromarray(frame_rgb)
+        result_pil = detect_image(frame_pil, obj_thresh, nms_thresh, net_h, net_w)
+        result_bgr = cv2.cvtColor(np.asarray(result_pil), cv2.COLOR_RGB2BGR)
+
+        if (result_bgr.shape[1], result_bgr.shape[0]) != video_size:
+            result_bgr = cv2.resize(result_bgr, video_size)
+        out.write(result_bgr)
+
+    vid.release()
+    out.release()
+    print(f"Done! Saved to {output_path}")
+
+
+# ── CELL 7: Run on still images ──────────────────────────────
+image_pil = Image.open('/content/data/image.jpg')
+result = detect_image(image_pil)
+plt.figure(figsize=(12, 8))
+plt.imshow(result)
+plt.axis('off')
+plt.title('image.jpg — detections')
+plt.show()
+
+image2_pil = Image.open('/content/data/image2.jpg')
+result2 = detect_image(image2_pil)
+plt.figure(figsize=(12, 8))
+plt.imshow(result2)
+plt.axis('off')
+plt.title('image2.jpg — detections')
+plt.show()
+
+
